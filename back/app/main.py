@@ -26,8 +26,8 @@ def create_app() -> FastAPI:
         title="NEX TERRA — Rotation Resilience Engine",
         description=(
             "Agricultural decision-support for Moroccan farmers. "
-            "Simulates crop rotations against satellite-derived soil + climate "
-            "data and ranks alternatives."
+            "Compares crop rotations with a prototype score, illustrative "
+            "climate scenarios, and explicit data provenance."
         ),
         version="0.1.0",
         docs_url="/docs",

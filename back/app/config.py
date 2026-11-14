@@ -14,7 +14,7 @@ class AppConfig(BaseSettings):
     # NASA POWER endpoint proxy cache TTL (seconds)
     nasa_power_cache_ttl: int = 3600
 
-    # Future climate scenarios (NEX-GDDP-CMIP6 deltas)
+    # Illustrative prototype climate scenarios; not validated regional projections.
     scenarios: list[dict] = Field(
         default=[
             {"id": "historical", "label": "Historical baseline",

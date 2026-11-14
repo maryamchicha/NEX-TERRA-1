@@ -6,14 +6,23 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
 from . import config as _cfg, models
+from .crop_catalog import CROP_CATALOG
 from .models import (ComparisonItem, ErrorResponse, FieldResult, FieldUpdate,
-                     RotationRequest, RotationResult, ScenariosResult, OptimizationResult)
+                     FarmField, RotationRequest, RotationResult, ScenariosResult,
+                     OptimizationResult)
 from .simulator import simulator as sim
 from fastapi import Body
+from .regions import (
+    BOUNDARY_SOURCE,
+    MOROCCO_REGIONS,
+    REGIONS_SOURCE_URL,
+    admin1_boundary_feature_collection,
+    region_codes_for_point,
+)
 
 router = APIRouter(tags=["nex-terra"])
 
@@ -59,17 +68,11 @@ def _build_soil_profile(soil: Optional[Dict[str, Any]]) -> sim.SoilProfile:
     return sim.build_soil_profile(p)
 
 
-def _nasa_payload() -> Dict[str, Any]:
-    """Pull real NASA observations for the demo field and return the payload
-    the engine's score_rotation() consumes."""
+def _nasa_payload(lat: float, lon: float) -> Dict[str, Any]:
+    """Return NASA POWER values for the farmer-selected field coordinates."""
     try:
-        # fetch real POWER/GPM/MODIS/SMAP observations for the Settat field
-        # (2019-2024) and embed them in the rotation score so the engine gets
-        # satellite-derived drought / vegetation / soil-moisture signals.
-        from app.nasa.client import (NasaClient, NasaConfig,
-                                     fetch_nasa_series)
-        nasa = fetch_nasa_series(32.75, -8.05, 2019, 2024)
-        return nasa
+        from app.nasa.client import fetch_nasa_series
+        return fetch_nasa_series(lat, lon, 2019, 2024)
     except Exception as exc:  # noqa: BLE001 - keep the demo online no matter what
         log.warning("nasa payload unavailable: %s", exc)
         return {
@@ -77,14 +80,67 @@ def _nasa_payload() -> Dict[str, Any]:
             "rainfall_mm_tot": 0.0,
             "sun_hours": 5.0,
             "humidity_pct": 45.0,
+            "temp_min_mean_c": None,
+            "temp_max_mean_c": None,
+            "solar_radiation_mj_m2_day": None,
+            "wind_mean_ms": None,
+            "et0_mean_mm_day": None,
+            "elevation_m": None,
             "evi": 0.42,
             "sm": 0.30,
             "cmip6": {"temp_mean_c": 18.6, "precipitation_mm": 0.0},
+            "lat": lat,
+            "lon": lon,
+            "observed_window_years": [2019, 2024],
+            "coverage": {},
+            "source_datasets": [],
+            "data_status": "synthetic",
+            "_synthetic": True,
+            "source_status": {
+                **{
+                    key: {
+                        "status": "synthetic",
+                        "source": "Route fallback",
+                    }
+                    for key in (
+                        "temp_mean_c", "rainfall_mm_tot", "sun_hours",
+                        "humidity_pct", "evi", "sm", "cmip6",
+                    )
+                },
+                **{
+                    key: {
+                        "status": "unavailable",
+                        "source": "NASA POWER",
+                        "reason": "NASA POWER weather data are unavailable",
+                    }
+                    for key in (
+                        "temp_min_mean_c", "temp_max_mean_c",
+                        "solar_radiation_mj_m2_day", "wind_mean_ms",
+                        "surface_pressure_mean_kpa",
+                    )
+                },
+                "et0": {
+                    "status": "unavailable",
+                    "source": "FAO-56 Penman-Monteith reference ET0",
+                    "units": "mm/day",
+                    "reason": "NASA POWER weather data are unavailable",
+                },
+            },
+            "source_note": "Synthetic fallback values; no NASA POWER estimates are available.",
         }
 
 
 def _default_climate() -> Dict[str, Any]:
     return {"temp_shift": 0.0, "precipitation": 1.0, "drought": 0.0}
+
+
+def _require_field(payload: RotationRequest) -> FarmField:
+    if payload.field is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Select a Moroccan field location before requesting a comparison",
+        )
+    return payload.field
 
 
 # --------------------------------------------------------------------------- #
@@ -110,6 +166,61 @@ def get_field():
         soil=raw.get("soil", {}),
         previous_crops=raw.get("previous_crops", ["winter_wheat"]),
     )
+
+
+@router.get("/regions")
+def list_regions():
+    """List Morocco's administrative regions and their boundary data source."""
+    return {
+        "regions": MOROCCO_REGIONS,
+        "source": {
+            "name": "Morocco Directorate General of Local Authorities",
+            "url": REGIONS_SOURCE_URL,
+            "note": (
+                "The selected region is user-provided and checked against the "
+                "mapped administrative boundary data."
+            ),
+        },
+        "boundary_source": BOUNDARY_SOURCE,
+    }
+
+
+@router.get("/regions/locate")
+def locate_region(
+    lat: float = Query(..., ge=-90.0, le=90.0),
+    lon: float = Query(..., ge=-180.0, le=180.0),
+):
+    """Return mapped administrative regions covering a coordinate."""
+    matching_codes = region_codes_for_point(lat, lon)
+    if not matching_codes:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Coordinates do not fall within a mapped Moroccan "
+                "administrative region"
+            ),
+        )
+    matching_regions = [
+        region for region in MOROCCO_REGIONS
+        if region["code"] in matching_codes
+    ]
+    return {
+        "region_codes": matching_codes,
+        "regions": matching_regions,
+        "boundary_source": BOUNDARY_SOURCE,
+    }
+
+
+@router.get("/regions/boundaries")
+def get_region_boundaries():
+    """Return simplified GeoJSON polygons for Morocco's 12 regions."""
+    return admin1_boundary_feature_collection()
+
+
+@router.get("/crops")
+def list_crops():
+    """Return crop life cycles, source provenance, and known regional evidence."""
+    return CROP_CATALOG
 
 
 # --------------------------------------------------------------------------- #
@@ -151,7 +262,7 @@ def update_field(payload: FieldUpdate):
 # --------------------------------------------------------------------------- #
 @router.get("/soil", responses={200: {"model": Dict[str, Any]}})
 def get_soil():
-    """Remote fetch of SoilGrids soil properties for the selected field."""
+    """Return the seeded demo soil profile; this is not a live SoilGrids query."""
     return _soil_default()
 
 
@@ -181,16 +292,23 @@ def get_history():
 # --------------------------------------------------------------------------- #
 @router.post("/simulate", response_model=RotationResult)
 def simulate(payload: RotationRequest):
-    """Simulate one crop rotation (or the optimized one) under one climate state."""
+    """Simulate one crop rotation under one climate state."""
+    field = _require_field(payload)
     rotator = app_state_roator()
-    soil = _build_soil_profile(payload.soil)
+    soil = _build_soil_profile(field.soil or payload.soil)
     climate = payload.climate or _default_climate()
-    nasa = _nasa_payload()  # real satellite/soil/climate-model observations
+    nasa = _nasa_payload(field.lat, field.lon)
 
     # default demonstration rotation A / B / C
     crops = payload.crops or ["winter_wheat", "winter_wheat", "winter_wheat"]
 
-    res = rotator.score_rotation(crops, soil, climate, nasa=nasa)
+    try:
+        res = rotator.score_rotation(
+            crops, soil, climate, nasa=nasa,
+            priority_weights=payload.priorities,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return RotationResult(
         id=climate.get("id", "default"),
@@ -207,8 +325,10 @@ def simulate(payload: RotationRequest):
         economic_potential_avg=res["economic_potential_avg"],
         econ_per_water_mad_m3=res["econ_per_water_mad_m3"],
         score=res["score"],
+        priority_weights=res["priority_weights"],
         seasons=res["seasons"],
         nasa=res["nasa"],
+        field=field,
     )
 
 
@@ -217,8 +337,7 @@ def simulate(payload: RotationRequest):
 # --------------------------------------------------------------------------- #
 @router.get("/scenarios", response_model=ScenariosResult)
 def list_scenarios():
-    """Return the future climate scenarios (NEX-GDDP-CMIP6 deltas) to stress-test
-    against."""
+    """Return illustrative climate scenarios for prototype stress testing."""
     return ScenariosResult(scenarios=_cfg.config.scenarios)
 
 
@@ -227,76 +346,199 @@ def list_scenarios():
 # --------------------------------------------------------------------------- #
 @router.post("/compare", response_model=Dict[str, Any])
 def compare(payload: RotationRequest):
-    """Compare >=3 rotations (A / B / C) across all climate scenarios and rank
-    them.
+    """Compare the supplied rotation and two illustrative alternatives.
 
     Returns:
-        - per-rotation metrics under each scenario
-        - ranked list (utility weighted by user priorities)
-        - the climate scenario that flips the ranking
+        - per-strategy metrics under each climate scenario
+        - strategy ranking by mean weighted score across scenarios
+        - the winner for each scenario
     """
+    field = _require_field(payload)
     rotator = app_state_roator()
-    soap = _build_soil_profile(payload.soil)
-    soil = soap
-    nasa = _nasa_payload()
+    soil = _build_soil_profile(field.soil or payload.soil)
+    nasa = _nasa_payload(field.lat, field.lon)
 
     scenario_ids = [s.get("id", "default") for s in _cfg.config.scenarios]
-    demo_rotation = payload.crops or ["winter_wheat", "winter_wheat", "winter_wheat"]
+    demo_rotation = payload.crops
+    strategies = [
+        {
+            "id": "current",
+            "label": "A. Current rotation (user input)",
+            "rotation": demo_rotation,
+            "rationale": "Reference sequence supplied for this comparison.",
+            "limitations": [
+                "The reference rotation is not independently validated.",
+                "Model coefficients are demonstration assumptions.",
+            ],
+        },
+        {
+            "id": "cereal_legume",
+            "label": "B. Cereal–legume rotation",
+            "rotation": ["winter_wheat", "faba_beans", "winter_wheat"],
+            "rationale": (
+                "Introduces a legume; the engine applies a modeled nitrogen "
+                "benefit, not a locally measured outcome."
+            ),
+            "limitations": [
+                "Pest and disease cycles are not modeled.",
+                "The nitrogen benefit is not validated for this field.",
+            ],
+        },
+        {
+            "id": "diversified",
+            "label": "C. Cereal–legume–oilseed rotation",
+            "rotation": ["barley", "chickpeas", "sunflower"],
+            "rationale": (
+                "Uses three crop families; the score does not account for "
+                "local market access or pest cycles."
+            ),
+            "limitations": [
+                "Market prices and input costs are not modeled.",
+                "The sequence is illustrative, not a regional calendar.",
+            ],
+        },
+    ]
+
+    catalog_by_code = {
+        crop["code"]: crop for crop in CROP_CATALOG["crops"]
+    }
+    for strategy in strategies:
+        strategy["crop_evidence"] = [
+            {
+                "code": code,
+                "name": catalog_by_code[code]["name"],
+                "life_cycle": catalog_by_code[code]["life_cycle"],
+                "national_status": catalog_by_code[code]["national_status"],
+                "source_ids": catalog_by_code[code]["source_ids"],
+                "documented_regions": catalog_by_code[code]["documented_regions"],
+                "evidence_note": catalog_by_code[code]["evidence_note"],
+            }
+            for code in strategy["rotation"]
+        ]
+        unverified_crops = sorted({
+            crop["name"] for crop in strategy["crop_evidence"]
+            if crop["national_status"] != "documented"
+        })
+        region_unverified_crops = sorted({
+            crop["name"] for crop in strategy["crop_evidence"]
+            if field.region_code not in crop["documented_regions"]
+        })
+        strategy["data_gaps"] = []
+        if unverified_crops:
+            strategy["data_gaps"].append(
+                "National crop-presence evidence is unverified or group-level "
+                f"for: {', '.join(unverified_crops)}."
+            )
+        if region_unverified_crops:
+            strategy["data_gaps"].append(
+                "The cited sources do not document these crops in the selected "
+                f"administrative region: {', '.join(region_unverified_crops)}. "
+                "This is a data gap, not evidence of absence."
+            )
 
     comparisons = []
     for sc in _cfg.config.scenarios:
-        sim_result = rotator.score_rotation(demo_rotation, soap, sc)
-        comparisons.append({
-            "scenario_id": sc.get("id", "default"),
-            "label": sc.get("label", "baseline"),
-            "temp_shift": sc.get("temp_shift", 0.0),
-            "precipitation": sc.get("precipitation", 1.0),
-            "drought": sc.get("drought", 0.0),
-            "rotation": list(sim_result["rotation"]),
-            "water_total_mm": sim_result["water_total_mm"],
-            "n_balance_kg": sim_result["n_balance_kg"],
-            "resilience_avg": sim_result["resilience_avg"],
-            "soil_protection_avg": sim_result["soil_protection_avg"],
-            "economic_potential_avg": sim_result["economic_potential_avg"],
-            "econ_per_water_mad_m3": sim_result["econ_per_water_mad_m3"],
-            "score": sim_result["score"],
-            "nasa": sim_result["nasa"],
-        })
+        for strategy in strategies:
+            try:
+                sim_result = rotator.score_rotation(
+                    strategy["rotation"], soil, sc, nasa=nasa,
+                    priority_weights=payload.priorities,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            comparisons.append({
+                "strategy_id": strategy["id"],
+                "strategy_label": strategy["label"],
+                "scenario_id": sc.get("id", "default"),
+                "label": sc.get("label", "baseline"),
+                "temp_shift": sc.get("temp_shift", 0.0),
+                "precipitation": sc.get("precipitation", 1.0),
+                "drought": sc.get("drought", 0.0),
+                "rotation": list(sim_result["rotation"]),
+                "water_total_mm": sim_result["water_total_mm"],
+                "n_balance_kg": sim_result["n_balance_kg"],
+                "resilience_avg": sim_result["resilience_avg"],
+                "soil_protection_avg": sim_result["soil_protection_avg"],
+                "economic_potential_avg": sim_result["economic_potential_avg"],
+                "econ_per_water_mad_m3": sim_result["econ_per_water_mad_m3"],
+                "score": sim_result["score"],
+                "priority_weights": sim_result["priority_weights"],
+            })
 
-    # rank all rotations under the selected / worst scenario
     ranked = _rank(comparisons)
-
-    # identify the scenario where the winner flips vs the baseline
-    base = _score_of(comparisons, "historical")
-    flip = None
-    for item in ranked:
-        for comp in comparisons:
-            if base and comp["score"] > base and item["score"] < comp["score"]:
-                pass
-    # simplest flip: the worst drought scenario
-    worst = max(comparisons, key=lambda c: c["temp_shift"])
-    if base:
-        worst_score = _score_of(comparisons, worst["scenario_id"])
-        flip = {"baseline_winner": base, "worst_winner": worst_score,
-                "worst_scenario": worst["scenario_id"]}
+    scenario_winners = []
+    for scenario_id in scenario_ids:
+        rows = [item for item in comparisons if item["scenario_id"] == scenario_id]
+        if rows:
+            winner = max(rows, key=lambda item: item["score"])
+            scenario_winners.append({
+                "scenario_id": scenario_id,
+                "strategy_id": winner["strategy_id"],
+                "strategy_label": winner["strategy_label"],
+                "score": winner["score"],
+            })
 
     return {
         "rotations": demo_rotation,
-        "rotation_names": {
-            "A_continuous_cereal": "A. Continuous cereal",
-            "B_cereal_legume": "B. Cereal-legume rotation",
-            "C_diversified": "C. Diversified (cover crop)",
-        },
+        "strategies": strategies,
+        "rotation_names": {strategy["id"]: strategy["label"]
+                           for strategy in strategies},
         "comparison": comparisons,
-        "ranked": [
-            {"rank": i + 1, "id": c["scenario_id"], "label": c["label"],
-             "score": c["score"], "water_mm": c["water_total_mm"]}
-            for i, c in enumerate(ranked)
-        ],
-        "climate_flip": flip or {"note": "No scenario flips the ranking."},
+        "ranked": ranked,
+        "scenario_winners": scenario_winners,
         "scenario_ids": scenario_ids,
         "scenarios": _cfg.config.scenarios,
+        "comparison_context": {
+            "score_status": "illustrative prototype heuristic",
+            "field_soil_status": (
+                "some user-provided soil information; unspecified properties "
+                "use prototype defaults"
+                if field.soil or payload.soil
+                else "prototype defaults; not measured"
+            ),
+            "nasa_data_status": nasa.get("data_status", "synthetic"),
+            "score_explanation": (
+                "A weighted sum of five prototype components using the "
+                "user-selected priority weights; the ranking is not a crop "
+                "recommendation."
+            ),
+            "score_inputs": [
+                "Prototype crop coefficients and water-demand assumptions.",
+                (
+                    "User-supplied soil measurements where present; otherwise "
+                    "prototype default soil values."
+                ),
+                "Illustrative climate-scenario deltas and normalized priority weights.",
+                (
+                    "Synthetic vegetation and soil-moisture placeholders, "
+                    "which affect the prototype resilience component."
+                ),
+            ],
+            "nasa_role": (
+                "NASA POWER weather and FAO-56 reference ET0 are shown as "
+                "climate context; observed weather and ET0 do not calibrate "
+                "the prototype crop coefficients or directly determine the "
+                "rotation score."
+            ),
+            "data_gaps": [
+                (
+                    "No verified crop calendar or crop-specific suitability "
+                    "layer is available for the selected administrative region."
+                ),
+                (
+                    "Crop-stage water schedules and crop-specific Kc values "
+                    "are not used to calculate the prototype water metric."
+                ),
+                "Pest and disease cycles are not modeled.",
+                (
+                    "The economic component uses prototype revenue assumptions; "
+                    "market prices, input costs, and net margins are not modeled."
+                ),
+                "The scores have not been calibrated against farm outcomes.",
+            ],
+        },
         "nasa": nasa,
+        "field": field.model_dump(),
     }
 
 
@@ -309,24 +551,25 @@ def optimize(request: Optional[RotationRequest] = None):
     (water, nitrogen, resilience, soil, economy) under a future climate
     scenario using SciPy differential evolution."""
 
+    if request is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Select a Moroccan field location before optimizing a rotation",
+        )
+    field = _require_field(request)
     rotator = app_state_roator()
-    soil = _build_soil_profile(request and request.soil)
+    soil = _build_soil_profile(field.soil or request.soil)
     climate = request and request.climate or _default_climate()
 
-    # default priorities: all equal
-    priorities = {
-        "water": 0.20,
-        "nitrogen": 0.15,
-        "resilience": 0.25,
-        "soil": 0.20,
-        "economy": 0.20,
-    }
-    # normalise
-    s = sum(priorities.values()) or 1.0
-    priorities = {k: v / s for k, v in priorities.items()}
-
-    res = rotator.optimize(soil, climate, priorities, max_seasons=3,
-                           water_cap_mm=None)
+    priorities = (
+        request.priorities if request
+        else models.DEFAULT_PRIORITY_WEIGHTS.copy()
+    )
+    nasa = _nasa_payload(field.lat, field.lon)
+    res = rotator.optimize(
+        soil, climate, priorities, max_seasons=3,
+        water_cap_mm=None, nasa=nasa,
+    )
     return OptimizationResult(**res)
 
 
@@ -334,17 +577,29 @@ def optimize(request: Optional[RotationRequest] = None):
 #  Ranking & explanation helpers (pure logic)
 # --------------------------------------------------------------------------- #
 def _rank(comparisons: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Sort by utility = weighted score across scenarios and metrics."""
-    # primary sort: mean score across scenarios (stability)
-    comparisons = sorted(comparisons, key=lambda c: c["score"], reverse=True)
-    return comparisons
+    """Rank strategies by mean weighted score over all climate scenarios."""
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for item in comparisons:
+        grouped.setdefault(item["strategy_id"], []).append(item)
 
-
-def _score_of(comparisons: List[Dict[str, Any]], scenario_id: str) -> Optional[float]:
-    for c in comparisons:
-        if c["scenario_id"] == scenario_id:
-            return c["score"]
-    return None
+    ranked = []
+    for strategy_id, rows in grouped.items():
+        scores = [item["score"] for item in rows]
+        ranked.append({
+            "id": strategy_id,
+            "label": rows[0]["strategy_label"],
+            "rotation": rows[0]["rotation"],
+            "average_score": round(sum(scores) / len(scores), 4),
+            "worst_case_score": round(min(scores), 4),
+            "water_mm": round(
+                sum(item["water_total_mm"] for item in rows) / len(rows), 1
+            ),
+        })
+    ranked.sort(key=lambda item: item["average_score"], reverse=True)
+    for rank, item in enumerate(ranked, start=1):
+        item["rank"] = rank
+        item["score"] = item["average_score"]
+    return ranked
 
 
 # --------------------------------------------------------------------------- #
@@ -358,29 +613,12 @@ def app_state_roator() -> sim.Rotator:
 
 
 @router.get("/nasa")
-def api_nasa():
-    """Return live satellite + climate-model observations for the demo field.
-
-    Built from real NASA POWER / GPM / MODIS / SMAP / NEX-GDDP-CMIP6 sources;
-    falls back to deterministic synthetic values when a live retrieval is
-    unreachable. Designed so the frontend renders satellite data with zero
-    extra engineering.
-    """
-    from app.nasa.client import fetch_nasa_series
-    try:
-        return fetch_nasa_series(32.75, -8.05, 2019, 2024)
-    except Exception as exc:  # noqa: BLE001 - keep the demo online no matter what
-        log.warning("nasa payload unavailable: %s", exc)
-        return {
-            "temp_mean_c": 16.8,
-            "rainfall_mm_tot": 0.0,
-            "sun_hours": 5.0,
-            "humidity_pct": 45.0,
-            "evi": 0.42,
-            "sm": 0.30,
-            "cmip6": {"temp_mean_c": 18.6, "precipitation_mm": 0.0},
-            "source_note": "offline fallback — real NASA data unavailable",
-        }
+def api_nasa(
+    lat: float = Query(..., ge=20.0, le=37.0),
+    lon: float = Query(..., ge=-18.0, le=0.0),
+):
+    """Return NASA values for a selected point within Morocco's broad envelope."""
+    return _nasa_payload(lat, lon)
 
 
 # --------------------------------------------------------------------------- #
@@ -388,28 +626,14 @@ def api_nasa():
 # --------------------------------------------------------------------------- #
 @router.get("/demo/seed.json", response_model=Dict[str, Any])
 def demo_seed():
-    """Return deterministic synthetic data so the frontend can run without a
-    live database."""
+    """Return simulator defaults without assigning a farm location or climate."""
     return {
-        "fields": [
-            {"id": "SET-001", "name": "Settat demo field",
-             "lat": 32.75, "lon": -8.05, "area_ha": 10.0,
-             "irrigation": "rainfed", "soil": _soil_default()},        ],  
-        "rotation_names": {  
-            "A_continuous_cereal": "A. Continuous cereal",  
-            "B_cereal_legume": "B. Cereal–legume rotation",  
-            "C_diversified": "C. Diversified rotation (cover crop)",  
-        },  
-        "scenarios": _cfg.config.scenarios,  
-        "priorities": {"water": 0.20, "nitrogen": 0.15, "resilience": 0.25,  
-                       "soil": 0.20, "economy": 0.20},  
-        "nasa": {  
-            "temp_mean_c": 16.8,  
-            "rainfall_mm_tot": 0.0,  
-            "sun_hours": 5.0,  
-            "humidity_pct": 45.0,  
-            "evi": 0.42,  
-            "sm": 0.30,  
-            "cmip6": {"temp_mean_c": 18.6, "precipitation_mm": 0.0},  
-        },  
+        "rotation_names": {
+            "current": "A. Current rotation (user input)",
+            "cereal_legume": "B. Cereal–legume rotation",
+            "diversified": "C. Cereal–legume–oilseed rotation",
+        },
+        "current_rotation": ["winter_wheat", "winter_wheat", "winter_wheat"],
+        "scenarios": _cfg.config.scenarios,
+        "priorities": models.DEFAULT_PRIORITY_WEIGHTS.copy(),
     }

@@ -1,18 +1,8 @@
-"""NEX TERRA — one-shot real-data pull for the demo field.
+"""Legacy demo-manifest generator; this module does not fetch NASA data.
 
-Downloads real NASA observations for the Settat field over a 5-year window and
-writes them to data/nasa/ as JSON so the rotation engine can consume them.
-
-Run:
-    .venv/bin/python app/data_pull.py
-
-Once fetched, the demo field's field.json gains an ``nasa`` section, and the
-engine uses it in place of synthetic climate.
-
-All endpoints are read-only public NASA services (POWER, GPM via EARTHDATA,
-MODIS EVI via NEON). Credentials (EDL_USERNAME/EDL_PASSWORD) are optional:
-most demo collections are open. Modify this file to swap collections or
-output formats if your org requires a proxy.
+The API retrieves NASA POWER daily temperature and precipitation estimates via
+``app.nasa.client.fetch_nasa_series``. This script only writes a static
+manifest and is not part of that request path.
 """
 
 from __future__ import annotations
