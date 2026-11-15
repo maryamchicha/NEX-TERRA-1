@@ -1,0 +1,26 @@
+NEX TERRA
+Copyright 2026 NEX TERRA contributors.
+
+The original source code is licensed under Apache License 2.0. This license
+does not cover third-party datasets, software dependencies, or visual assets.
+
+Data and map acknowledgements:
+- NASA POWER: climate data; see https://power.larc.nasa.gov/
+- OpenStreetMap contributors: map data, tiles, and place names;
+  Open Database License (ODbL); https://www.openstreetmap.org/copyright
+- geoBoundaries GB Open Morocco ADM1 boundaries: Open Data Commons Open
+  Database License 1.0; see https://opendatacommons.org/licenses/odbl/1-0/
+  and https://github.com/wmgeolab/geoBoundaries/tree/9469f09/releaseData/gbOpen/MAR/ADM1
+
+Direct frontend software dependencies:
+- React, React DOM, React Router, Supabase JavaScript, Vite, and
+  @vitejs/plugin-react: MIT License.
+- Leaflet: BSD 2-Clause License.
+
+The application links to the source records and applicable license terms in
+its footer and README. NASA POWER and FAO materials are cited as data sources
+and references; their own terms continue to apply.
+
+The project-supplied hero artwork is not covered by the source-code license.
+Its redistribution rights must be confirmed by the project owner before
+public deployment.

@@ -11,9 +11,10 @@ from pydantic import BaseModel
 
 from . import config as _cfg, models
 from .crop_catalog import CROP_CATALOG
+from .geocoding import reverse_geocode
 from .models import (ComparisonItem, ErrorResponse, FieldResult, FieldUpdate,
-                     FarmField, RotationRequest, RotationResult, ScenariosResult,
-                     OptimizationResult)
+                     FarmField, RotationRecommendationRequest, RotationRequest,
+                     RotationResult, ScenariosResult, OptimizationResult)
 from .simulator import simulator as sim
 from fastapi import Body
 from .regions import (
@@ -208,6 +209,22 @@ def locate_region(
         "region_codes": matching_codes,
         "regions": matching_regions,
         "boundary_source": BOUNDARY_SOURCE,
+    }
+
+
+@router.get("/places/reverse")
+def locate_place(
+    lat: float = Query(..., ge=20.0, le=37.0),
+    lon: float = Query(..., ge=-18.0, le=0.0),
+):
+    """Return a nearby named locality for coordinates in the Moroccan map area."""
+    try:
+        place = reverse_geocode(lat, lon)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        **(place or {}),
+        "place_name": place["place_name"] if place else None,
     }
 
 
@@ -539,6 +556,232 @@ def compare(payload: RotationRequest):
         },
         "nasa": nasa,
         "field": field.model_dump(),
+    }
+
+
+@router.post("/recommendations")
+def recommend_rotations(payload: RotationRecommendationRequest):
+    """Generate exploratory crop rotations for a selected field and priorities."""
+    field = payload.field
+    scenarios = _cfg.config.scenarios
+    scenario = next(
+        (item for item in scenarios if item.get("id") == payload.scenario_id),
+        None,
+    )
+    if scenario is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown climate scenario: {payload.scenario_id}",
+        )
+
+    rotator = app_state_roator()
+    soil = _build_soil_profile(field.soil)
+    nasa = _nasa_payload(field.lat, field.lon)
+    recommendations = rotator.recommend_rotations(
+        soil,
+        scenario,
+        payload.priorities,
+        nasa=nasa,
+        current_rotation=payload.current_rotation,
+        count=3,
+    )
+    if len(recommendations) < 3:
+        raise HTTPException(
+            status_code=503,
+            detail="Not enough supported crop combinations to generate three diverse options",
+        )
+
+    strategies = []
+    if payload.current_rotation:
+        strategies.append({
+            "id": "current",
+            "label": "Your current rotation (baseline)",
+            "rotation": list(payload.current_rotation),
+            "rationale": (
+                "Entered by the farmer and included as a reference for "
+                "comparing the generated options."
+            ),
+            "limitations": [
+                "The current rotation and its outcomes are not independently validated.",
+            ],
+        })
+
+    for index, result in enumerate(recommendations, start=1):
+        if index == 1:
+            label = "Suggested option 1 — closest match to your priorities"
+            rationale = (
+                "Highest prototype score for the selected climate scenario "
+                "and priorities among supported sequences with three "
+                "different simulator crop families."
+            )
+        else:
+            label = f"Suggested option {index} — alternative crop mix"
+            rationale = (
+                "A high-scoring, diverse alternative selected so you can "
+                "compare a different mix of crops."
+            )
+        strategies.append({
+            "id": f"suggested_{index}",
+            "label": label,
+            "rotation": list(result["rotation"]),
+            "rationale": rationale,
+            "limitations": [
+                "Crop-family diversity is a prototype search rule, not proof of local suitability.",
+                "Sequence positions are not a region-specific planting calendar.",
+                "Pest, disease, labor, and market constraints are not modeled.",
+            ],
+        })
+
+    catalog_by_code = {
+        crop["code"]: crop for crop in CROP_CATALOG["crops"]
+    }
+    for strategy in strategies:
+        strategy["crop_evidence"] = [
+            {
+                "code": code,
+                "name": catalog_by_code[code]["name"],
+                "life_cycle": catalog_by_code[code]["life_cycle"],
+                "national_status": catalog_by_code[code]["national_status"],
+                "source_ids": catalog_by_code[code]["source_ids"],
+                "documented_regions": catalog_by_code[code]["documented_regions"],
+                "evidence_note": catalog_by_code[code]["evidence_note"],
+            }
+            for code in strategy["rotation"]
+        ]
+        unverified_crops = sorted({
+            crop["name"] for crop in strategy["crop_evidence"]
+            if crop["national_status"] != "documented"
+        })
+        region_unverified_crops = sorted({
+            crop["name"] for crop in strategy["crop_evidence"]
+            if field.region_code not in crop["documented_regions"]
+        })
+        strategy["data_gaps"] = []
+        if unverified_crops:
+            strategy["data_gaps"].append(
+                "National crop-presence evidence is unverified or group-level "
+                f"for: {', '.join(unverified_crops)}."
+            )
+        if region_unverified_crops:
+            strategy["data_gaps"].append(
+                "The cited sources do not document these crops in the selected "
+                f"administrative region: {', '.join(region_unverified_crops)}. "
+                "This is a data gap, not evidence of absence."
+            )
+
+    comparisons = []
+    for climate_scenario in scenarios:
+        for strategy in strategies:
+            try:
+                result = rotator.score_rotation(
+                    strategy["rotation"],
+                    soil,
+                    climate_scenario,
+                    nasa=nasa,
+                    priority_weights=payload.priorities,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            comparisons.append({
+                "strategy_id": strategy["id"],
+                "strategy_label": strategy["label"],
+                "scenario_id": climate_scenario.get("id", "default"),
+                "label": climate_scenario.get("label", "baseline"),
+                "temp_shift": climate_scenario.get("temp_shift", 0.0),
+                "precipitation": climate_scenario.get("precipitation", 1.0),
+                "drought": climate_scenario.get("drought", 0.0),
+                "rotation": list(result["rotation"]),
+                "water_total_mm": result["water_total_mm"],
+                "n_balance_kg": result["n_balance_kg"],
+                "resilience_avg": result["resilience_avg"],
+                "soil_protection_avg": result["soil_protection_avg"],
+                "economic_potential_avg": result["economic_potential_avg"],
+                "econ_per_water_mad_m3": result["econ_per_water_mad_m3"],
+                "score": result["score"],
+                "priority_weights": result["priority_weights"],
+            })
+
+    scenario_ids = [item.get("id", "default") for item in scenarios]
+    scenario_winners = []
+    for scenario_id in scenario_ids:
+        rows = [item for item in comparisons if item["scenario_id"] == scenario_id]
+        if rows:
+            winner = max(rows, key=lambda item: item["score"])
+            scenario_winners.append({
+                "scenario_id": scenario_id,
+                "strategy_id": winner["strategy_id"],
+                "strategy_label": winner["strategy_label"],
+                "score": winner["score"],
+            })
+
+    return {
+        "rotations": payload.current_rotation or [],
+        "strategies": strategies,
+        "rotation_names": {
+            strategy["id"]: strategy["label"] for strategy in strategies
+        },
+        "comparison": comparisons,
+        "ranked": _rank(comparisons),
+        "scenario_winners": scenario_winners,
+        "scenario_ids": scenario_ids,
+        "scenarios": scenarios,
+        "comparison_context": {
+            "score_status": "illustrative prototype heuristic",
+            "field_soil_status": (
+                "user-provided soil information; unspecified properties use "
+                "prototype defaults"
+                if field.soil
+                else "prototype defaults; not measured"
+            ),
+            "nasa_data_status": nasa.get("data_status", "synthetic"),
+            "score_explanation": (
+                "Options are generated by searching supported three-crop "
+                "sequences with different simulator crop families, then "
+                "ranking them for the selected scenario and priorities. "
+                "They are exploratory candidates, not validated recommendations."
+            ),
+            "score_inputs": [
+                "Prototype crop coefficients and water-demand assumptions.",
+                (
+                    "User-supplied soil measurements where present; otherwise "
+                    "prototype default soil values."
+                ),
+                "The selected illustrative climate scenario and normalized priority weights.",
+                (
+                    "Synthetic vegetation and soil-moisture placeholders, "
+                    "which affect the prototype resilience component."
+                ),
+            ],
+            "nasa_role": (
+                "NASA POWER weather and FAO-56 reference ET0 are shown as "
+                "climate context; observed weather and ET0 do not calibrate "
+                "the prototype crop coefficients or directly determine the "
+                "rotation score."
+            ),
+            "data_gaps": [
+                (
+                    "No verified crop calendar or crop-specific suitability "
+                    "layer is available for the selected administrative region."
+                ),
+                (
+                    "Crop-stage water schedules and crop-specific Kc values "
+                    "are not used to calculate the prototype water metric."
+                ),
+                (
+                    "Crop presence may be unverified in the selected region; "
+                    "see each option's evidence and data gaps."
+                ),
+                "Pest and disease cycles are not modeled.",
+                (
+                    "The economic component uses prototype revenue assumptions; "
+                    "market prices, input costs, and net margins are not modeled."
+                ),
+                "The scores have not been calibrated against farm outcomes.",
+            ],
+        },
+        "nasa": nasa,
+        "field": field.model_dump(),
+        "scenario_id": payload.scenario_id,
     }
 
 

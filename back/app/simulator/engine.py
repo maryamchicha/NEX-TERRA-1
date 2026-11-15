@@ -26,17 +26,21 @@ import json
 import math
 import os
 from dataclasses import dataclass, field
+from itertools import product
 from typing import Iterable, List, Optional
 
 import numpy as np
 from scipy.optimize import differential_evolution
 
+from ..crop_catalog import CROP_CATALOG
 from ..models import DEFAULT_PRIORITY_WEIGHTS
 
 # --------------------------------------------------------------------------- #
 #  Paths and seed data
 # --------------------------------------------------------------------------- #
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 DATA_DIR = os.path.join(BASE_DIR, "data")
 SOILGRIDS_JSON = os.path.join(DATA_DIR, "soilgrids.json")
 CROP_JSON = os.path.join(DATA_DIR, "crops.json")
@@ -96,16 +100,26 @@ DEFAULT_SEAS = {
 
 # Crop family / nutrient strategy
 DEFAULT_FAMILIES = {
-    "cereal": "cereal",
-    "legume": "legume",
-    "root": "root",
-    "tuber": "tuber",
-    "vegetable": "vegetable",
-    "oilseed": "oilseed",
-    "cinquefoil": "legume",  # alfalfa / clover = perennial legume
-    "cover": "cover",
+    "winter_wheat": "cereal",
+    "barley": "cereal",
+    "faba_beans": "legume",
+    "chickpeas": "legume",
+    "lentils": "legume",
+    "sunflower": "oilseed",
+    "sugar_beet": "root",
+    "sweet_potato": "tuber",
+    "potato": "tuber",
+    "tomato": "vegetable",
+    "onion": "vegetable",
+    "carrot": "root",
+    "alfalfa": "cover",
+    "clover": "cover",
+    "lettuce": "vegetable",
     "maize": "cereal",
     "sorghum": "cereal",
+    "pulses": "legume",
+    "cereal_mix": "cereal",
+    "fallow": "fallow",
 }
 
 # Rotation compatibility matrix (transition probability 0..1, also encodes
@@ -620,6 +634,61 @@ class Rotator:
             "seasons": season_metrics,
             "water_cap_factor": water_penalty,
         }
+
+    def recommend_rotations(
+        self,
+        soil: SoilProfile,
+        climate: dict,
+        priority_weights: dict,
+        nasa: Optional[dict] = None,
+        current_rotation: Optional[List[str]] = None,
+        count: int = 3,
+    ) -> List[dict]:
+        """Return diverse, score-ranked candidates from supported annual crops."""
+        pool = [
+            item["code"] for item in CROP_CATALOG["crops"]
+            if item["rotation_eligible"] and self.crops.crop(item["code"])
+        ]
+        family_by_code = {
+            code: self.crops.crop(code).family
+            for code in pool
+        }
+        candidates = []
+        for rotation in product(pool, repeat=3):
+            families = {family_by_code[code] for code in rotation}
+            if len(families) != 3:
+                continue
+            if current_rotation and set(rotation) == set(current_rotation):
+                continue
+            candidates.append(self.score_rotation(
+                list(rotation),
+                soil,
+                climate,
+                nasa=nasa,
+                priority_weights=priority_weights,
+            ))
+
+        candidates.sort(
+            key=lambda result: (-result["score"], tuple(result["rotation"]))
+        )
+        selected = []
+        selected_rotations = set()
+        for maximum_shared_crops in (1, 2, 3):
+            for candidate in candidates:
+                rotation = tuple(candidate["rotation"])
+                if rotation in selected_rotations:
+                    continue
+                if any(
+                    len(set(rotation) & set(previous["rotation"])) > maximum_shared_crops
+                    for previous in selected
+                ):
+                    continue
+                selected.append(candidate)
+                selected_rotations.add(rotation)
+                if len(selected) == count:
+                    return selected
+
+        return selected
 
     # -- scikit-learn fallback model -------------------------------------- #
     def fit(self, historical: Optional[Iterable[dict]] = None):

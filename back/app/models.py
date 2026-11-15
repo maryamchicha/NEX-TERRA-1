@@ -165,6 +165,44 @@ class FarmField(BaseModel):
         return value
 
 
+class RotationRecommendationRequest(BaseModel):
+    field: FarmField
+    scenario_id: str = "historical"
+    current_rotation: Optional[List[str]] = Field(
+        default=None, min_length=3, max_length=3
+    )
+    priorities: Dict[str, float] = Field(
+        default_factory=lambda: DEFAULT_PRIORITY_WEIGHTS.copy()
+    )
+
+    @field_validator("current_rotation")
+    @classmethod
+    def annual_current_rotation_only(
+        cls, value: Optional[List[str]]
+    ) -> Optional[List[str]]:
+        if value is None:
+            return value
+        invalid = sorted(set(value) - ROTATION_CROP_CODES)
+        if invalid:
+            raise ValueError(
+                "Unknown or non-selectable crop code(s) for annual rotation: "
+                f"{', '.join(invalid)}"
+            )
+        return value
+
+    @field_validator("priorities")
+    @classmethod
+    def valid_priorities(cls, value: Dict[str, float]) -> Dict[str, float]:
+        unknown = set(value) - set(DEFAULT_PRIORITY_WEIGHTS)
+        if unknown:
+            raise ValueError(f"Unknown priority keys: {', '.join(sorted(unknown))}")
+        if any(not math.isfinite(weight) or weight < 0 for weight in value.values()):
+            raise ValueError("Priority weights must be finite and non-negative")
+        if not any(weight > 0 for weight in value.values()):
+            raise ValueError("At least one priority weight must be greater than zero")
+        return value
+
+
 # --------------------------------------------------------------------------- #
 #  Response payloads
 # --------------------------------------------------------------------------- #

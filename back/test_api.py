@@ -4,6 +4,7 @@ Run with: .venv/bin/python -m pytest test_api.py -q
 """
 
 import json
+from collections import OrderedDict
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from app import main as main_module
 from app import routes
+from app import geocoding
 from app.nasa import client as nasa_client
 from app.main import create_app
 from app.simulator import engine
@@ -346,6 +348,96 @@ def test_region_location_endpoint_rejects_points_outside_mapped_regions(client):
     assert "mapped Moroccan administrative region" in response.json()["detail"]
 
 
+def test_reverse_place_endpoint_returns_locality_and_context(client, monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        "reverse_geocode",
+        lambda lat, lon: {
+            "place_name": "Agdal",
+            "context": "Rabat",
+            "attribution_url": "https://www.openstreetmap.org/copyright",
+        },
+    )
+
+    response = client.get(
+        "/api/places/reverse",
+        params={"lat": 34.02, "lon": -6.84},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["place_name"] == "Agdal"
+    assert response.json()["context"] == "Rabat"
+    assert response.json()["attribution_url"].endswith("/copyright")
+
+
+def test_reverse_place_endpoint_returns_empty_locality_when_unavailable_in_map_data(
+    client, monkeypatch
+):
+    monkeypatch.setattr(routes, "reverse_geocode", lambda lat, lon: None)
+
+    response = client.get(
+        "/api/places/reverse",
+        params={"lat": 34.02, "lon": -6.84},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["place_name"] is None
+
+
+def test_reverse_place_endpoint_reports_lookup_service_failure(client, monkeypatch):
+    def fail_lookup(lat, lon):
+        raise RuntimeError("Nearby locality lookup is temporarily unavailable.")
+
+    monkeypatch.setattr(routes, "reverse_geocode", fail_lookup)
+
+    response = client.get(
+        "/api/places/reverse",
+        params={"lat": 34.02, "lon": -6.84},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Nearby locality lookup is temporarily unavailable."
+    )
+
+
+def test_reverse_geocoder_returns_precise_locality_and_caches_result(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "address": {
+                    "neighbourhood": "Agdal",
+                    "city": "Rabat",
+                    "country": "Morocco",
+                }
+            }
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr(geocoding.requests, "get", fake_get)
+    monkeypatch.setattr(geocoding.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(geocoding, "_cache", OrderedDict())
+    monkeypatch.setattr(geocoding, "_last_request_at", 0.0)
+
+    first = geocoding.reverse_geocode(34.02, -6.84)
+    second = geocoding.reverse_geocode(34.02001, -6.84001)
+
+    assert first == second
+    assert first["place_name"] == "Agdal"
+    assert first["context"] == "Rabat"
+    assert len(calls) == 1
+    assert calls[0][1]["params"]["format"] == "jsonv2"
+    assert calls[0][1]["headers"]["User-Agent"]
+    assert calls[0][1]["headers"]["Accept-Language"] == "fr,en"
+
+
 def test_simulate_endpoint(client):
     payload = {
         "crops": ["winter_wheat", "faba_beans", "winter_wheat"],
@@ -402,6 +494,80 @@ def test_compare_endpoint(client):
     assert faba_evidence["national_status"] == "unverified"
     assert any("data gap, not evidence of absence" in item
                for item in cereal_legume["data_gaps"])
+
+
+def test_recommendations_generate_three_options_without_current_rotation(client):
+    response = client.post("/api/recommendations", json={
+        "field": TEST_FARM_FIELD,
+        "scenario_id": "historical",
+    })
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["strategies"]) == 3
+    assert [item["id"] for item in body["strategies"]] == [
+        "suggested_1", "suggested_2", "suggested_3",
+    ]
+    rotations = [item["rotation"] for item in body["strategies"]]
+    assert all(len(rotation) == 3 and len(set(rotation)) == 3
+               for rotation in rotations)
+    assert len({tuple(rotation) for rotation in rotations}) == 3
+    simulator = engine.Rotator()
+    assert all(
+        len({simulator.crops.crop(code).family for code in rotation}) == 3
+        for rotation in rotations
+    )
+    assert len(body["comparison"]) == 12
+    assert len(body["ranked"]) == 3
+    assert body["comparison_context"]["score_status"] == (
+        "illustrative prototype heuristic"
+    )
+    assert all(item["crop_evidence"] for item in body["strategies"])
+
+
+def test_recommendations_can_include_an_optional_current_rotation(client):
+    current_rotation = ["winter_wheat", "barley", "lentils"]
+    response = client.post("/api/recommendations", json={
+        "field": TEST_FARM_FIELD,
+        "scenario_id": "historical",
+        "current_rotation": current_rotation,
+    })
+    assert response.status_code == 200
+    body = response.json()
+    current = next(item for item in body["strategies"] if item["id"] == "current")
+    assert current["rotation"] == current_rotation
+    assert len(body["strategies"]) == 4
+    assert len(body["comparison"]) == 16
+
+
+def test_recommendations_remain_available_with_synthetic_climate_data(
+    client, monkeypatch
+):
+    monkeypatch.setattr(routes, "_nasa_payload", lambda lat, lon: {
+        "data_status": "synthetic",
+        "_synthetic": True,
+        "evi": 0.42,
+        "sm": 0.30,
+        "source_note": "NASA POWER unavailable; synthetic fallback.",
+    })
+    response = client.post("/api/recommendations", json={
+        "field": TEST_FARM_FIELD,
+        "scenario_id": "historical",
+    })
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["strategies"]) == 3
+    assert body["comparison_context"]["nasa_data_status"] == "synthetic"
+    assert "do not calibrate" in body["comparison_context"]["nasa_role"]
+
+
+def test_recommendations_reject_non_selectable_current_crop(client):
+    response = client.post("/api/recommendations", json={
+        "field": TEST_FARM_FIELD,
+        "current_rotation": ["alfalfa", "barley", "lentils"],
+    })
+    assert response.status_code == 422
+    assert any("annual rotation" in item["msg"]
+               for item in response.json()["detail"])
 
 
 def test_optimize_endpoint(client):
@@ -757,3 +923,34 @@ def test_nasa_power_failure_is_marked_synthetic(tmp_path, monkeypatch):
     assert payload["source_status"]["temp_mean_c"]["status"] == "synthetic"
     assert payload["source_status"]["et0"]["status"] == "unavailable"
     assert "synthetic placeholders" in payload["source_note"]
+
+
+@pytest.mark.parametrize(
+    ("configured_origins", "origin"),
+    [
+        (
+            "https://nexterra.example, https://www.nexterra.example/",
+            "https://www.nexterra.example",
+        ),
+        (None, "http://localhost:5173"),
+    ],
+)
+def test_cors_allows_configured_and_local_origins(
+    monkeypatch, configured_origins, origin
+):
+    if configured_origins is None:
+        monkeypatch.delenv("NEX_TERRA_ALLOWED_ORIGINS", raising=False)
+    else:
+        monkeypatch.setenv("NEX_TERRA_ALLOWED_ORIGINS", configured_origins)
+
+    with TestClient(create_app()) as test_client:
+        response = test_client.options(
+            "/health",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
