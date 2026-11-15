@@ -86,46 +86,41 @@ account's history. The simulator remains available to visitors without an
 account. The Supabase project and production email configuration are not
 provisioned by this repository.
 
-## Free public deployment with Render and Supabase
+## Free public deployment with Vercel and Supabase
 
-The included `render.yaml` defines a free Render static site for the React
-frontend and a separate free Python web service for FastAPI. Render supplies
-public HTTPS `onrender.com` URLs, so a custom domain or Porkbun hosting is not
-required.
+The repository is configured for one Vercel project: Vercel builds the React
+frontend from `front/` and runs the FastAPI application as a Python Function.
+The frontend and API share one HTTPS origin, so `VITE_API_BASE_URL` can remain
+unset. Vercel's [Hobby plan](https://vercel.com/docs/plans/hobby) is listed as
+free and intended for personal projects; Vercel documents
+[FastAPI/Python support](https://vercel.com/docs/frameworks/backend/fastapi).
+The plan has usage limits. Do not select a paid plan or enter payment details
+if your account asks for them.
 
-1. Connect the public GitHub repository to Render and deploy its Blueprint
-   from the branch containing `render.yaml`. The API service builds from
-   `back/`, installs `back/requirements.txt`, listens on Render's `$PORT`, and
-   checks `/health`. The static site builds from `front/` with `npm ci` followed
-   by `npm run build`, and publishes `front/dist/`.
-2. After Render has created both services and assigned their URLs, set these
-   environment variables in the Render dashboard:
-
-   * **Frontend:** `VITE_API_BASE_URL` to the API's HTTPS origin;
-     `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` from the Supabase
-     project. Rebuild and deploy the static site after changing these values.
-   * **Backend:** `NEX_TERRA_ALLOWED_ORIGINS` to the exact frontend origin,
-     such as `https://nex-terra-frontend.onrender.com`.
-
-   These values are intentionally absent from `render.yaml`. The Supabase
-   publishable key is safe for browser use with the migration's RLS policies;
-   never add a service-role key to the frontend.
-3. Create a Supabase project on its Free plan, run both migrations in filename
-   order, and set the Supabase Auth Site URL and allowed redirect URLs to the
-   actual Render frontend URL. Authentication is optional for the public
+1. In Vercel, import the public GitHub repository
+   [`manabouate-cell/NEX-TERRA`](https://github.com/manabouate-cell/NEX-TERRA).
+   Keep the project root at the repository root; the build settings in
+   `pyproject.toml` install the frontend dependencies and build `front/`.
+2. After the first deployment, copy its public HTTPS URL. In Vercel's project
+   settings, add `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` as
+   environment variables if accounts and saved farm profiles are wanted.
+   Redeploy after setting or changing these values. The publishable key is
+   intended for browser use with the migration's RLS policies; never add a
+   service-role key to frontend variables.
+3. In Supabase Auth, set the Site URL and allowed redirect URLs to the actual
+   Vercel URL. Create a Supabase project on its Free plan and run both SQL
+   migrations in filename order. Authentication is optional for the public
    simulation; it is required only to save a farm profile or simulation run.
-4. Verify the frontend, `/health`, public API routes, field selection, a
-   simulation, page refresh/navigation, account profile save/load, and
-   consented simulation save/load/delete before sharing the URL.
+4. Verify the homepage, `/health`, the `/api/` routes, field selection,
+   simulation, page refresh/navigation, and (if enabled) consented profile and
+   simulation save/load/delete before sharing the URL.
 
-Render's Free web service sleeps after 15 minutes without traffic and can take
-about a minute to wake; its filesystem is ephemeral, so the NASA response cache
-is not durable. Render's free usage limits can suspend services or lead to
-charges depending on the account's billing setup. Supabase Free projects may
+Vercel Hobby includes monthly usage limits; deployments or functions may be
+limited after those free allowances are reached. Supabase Free projects may
 pause after a week without activity, have no downloadable database backups,
 and include limited storage. These free tiers are suitable for a demonstration,
-not guaranteed 24/7 production service. Do not add a payment method or upgrade
-without reviewing the current provider terms and obtaining approval.
+not guaranteed 24/7 production service. If Vercel asks for a payment method or
+paid upgrade, stop rather than entering card details.
 
 Never put a Supabase secret/service-role key in the frontend or commit real
 credentials. The app is an exploratory prototype: its rotation scores and

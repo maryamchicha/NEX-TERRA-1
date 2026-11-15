@@ -1,0 +1,8 @@
+[tool.vercel]
+entrypoint = "main:app"
+
+[tool.vercel.scripts]
+build = "npm --prefix front ci && npm --prefix front run build"
+
+[tool.vercel.fastapi.static]
+cdn = true

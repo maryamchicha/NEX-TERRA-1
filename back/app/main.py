@@ -69,14 +69,13 @@ def create_app() -> FastAPI:
     def health(request: Request) -> dict:
         return {"status": "ok", "service": "nex-terra", "engine": "rotation-simulator"}
 
-    @app.get("/")
-    def index(request: Request) -> FileResponse:
-        frontend = BASE_DIR / ".." / "front" / "dist"
-        if frontend.is_dir():
-            index_file = frontend / "index.html"
-            if index_file.exists():
-                return FileResponse(index_file)
-        return FileResponse(BASE_DIR / "public" / "index.html")
+    frontend = BASE_DIR.parent / "front" / "dist"
+    if frontend.is_dir():
+        app.frontend("/", directory=str(frontend), fallback="index.html")
+    else:
+        @app.get("/")
+        def index(request: Request) -> FileResponse:
+            return FileResponse(BASE_DIR / "public" / "index.html")
 
     # ---- startup ----------------------------------------------------------- #
     @app.on_event("startup")
