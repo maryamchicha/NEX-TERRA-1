@@ -2186,7 +2186,7 @@ export default function App() {
                 </a>
               )}
               <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap <span>Map tiles and place-name attribution</span></a>
-              <a href="https://github.com/Berceaupiste/nex-terra" target="_blank" rel="noreferrer">NEX TERRA source code <span>Apache License 2.0</span></a>
+              <a href="https://github.com/manabouate-cell/NEX-TERRA" target="_blank" rel="noreferrer">NEX TERRA source code <span>Apache License 2.0</span></a>
             </section>
           </div>
         </section>
